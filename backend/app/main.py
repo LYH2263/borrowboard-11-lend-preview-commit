@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.borrow_rules import can_lend, classify_loans
+from app.engines.borrow_rules import can_lend, classify_loans, validate_lend
 
 app = FastAPI(title="Borrowboard", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -64,6 +64,77 @@ def lend(iid: int, body: LendIn):
         (iid, body.borrower, "active", body.due_date, datetime.now(timezone.utc).isoformat()))
     c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
     c.commit(); lid = cur.lastrowid; c.close(); return {"loan_id": lid}
+
+@app.post("/api/items/{iid}/preview")
+def preview_lend(iid: int, body: LendIn):
+    """Dry-run a lend: validate + snapshot current lendability, issue a ticket.
+
+    Writes only lend_tickets — items/loans (and thus board counts) are untouched.
+    """
+    v = validate_lend(body.borrower, body.due_date)
+    if not v["ok"]:
+        raise HTTPException(400, v["reason"])
+    c = connect()
+    item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+    if not item: c.close(); raise HTTPException(404, "item")
+    active = c.execute("SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'", (iid,)).fetchone()["c"]
+    check = can_lend(item["status"], active)
+    if not check["ok"]:
+        c.close(); raise HTTPException(409, check["reason"])
+    cur = c.execute(
+        "INSERT INTO lend_tickets(item_id,borrower,due_date,status,created_at) VALUES (?,?,?,?,?)",
+        (iid, body.borrower.strip(), body.due_date.strip(), "open", datetime.now(timezone.utc).isoformat()))
+    c.commit(); tid = cur.lastrowid; c.close()
+    return {"ticket_id": tid, "item_id": iid, "title": item["title"],
+            "borrower": body.borrower.strip(), "due_date": body.due_date.strip()}
+
+@app.post("/api/tickets/{tid}/confirm")
+def confirm_ticket(tid: int):
+    """Confirm a preview ticket: re-run lend rules under a write lock, then commit atomically.
+
+    BEGIN IMMEDIATE serializes concurrent confirms; the conditional UPDATE is a CAS
+    backstop. Failure paths touch only lend_tickets — never items/loans.
+    """
+    c = connect()
+    c.isolation_level = None  # explicit BEGIN IMMEDIATE / COMMIT / ROLLBACK
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        t = c.execute("SELECT * FROM lend_tickets WHERE id=?", (tid,)).fetchone()
+        if not t:
+            c.execute("ROLLBACK"); raise HTTPException(404, "ticket")
+        if t["status"] != "open":
+            c.execute("ROLLBACK"); raise HTTPException(409, "ticket_" + t["status"])
+        v = validate_lend(t["borrower"], t["due_date"])
+        item = c.execute("SELECT * FROM items WHERE id=?", (t["item_id"],)).fetchone()
+        active = c.execute("SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'",
+                           (t["item_id"],)).fetchone()["c"]
+        check = can_lend(item["status"], active) if item else {"ok": False, "reason": "item_missing"}
+        if not v["ok"] or not check["ok"]:
+            now = datetime.now(timezone.utc).isoformat()
+            c.execute("UPDATE lend_tickets SET status='failed', resolved_at=? WHERE id=?", (now, tid))
+            c.execute("COMMIT")  # ticket row only; items/loans never touched
+            if not v["ok"]:
+                raise HTTPException(400, v["reason"])
+            raise HTTPException(404 if not item else 409, check["reason"])
+        now = datetime.now(timezone.utc).isoformat()
+        cur = c.execute(
+            "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
+            (t["item_id"], t["borrower"], "active", t["due_date"], now))
+        r = c.execute("UPDATE items SET status='on_loan' WHERE id=? AND status='available'", (t["item_id"],))
+        if r.rowcount != 1:
+            c.execute("ROLLBACK"); raise HTTPException(409, "race_lost")
+        lid = cur.lastrowid
+        c.execute("UPDATE lend_tickets SET status='consumed', resolved_at=? WHERE id=?", (now, tid))
+        c.execute("COMMIT")
+        return {"loan_id": lid, "item_id": t["item_id"], "borrower": t["borrower"], "due_date": t["due_date"]}
+    except HTTPException:
+        raise
+    except Exception:
+        try: c.execute("ROLLBACK")
+        except Exception: pass
+        raise
+    finally:
+        c.close()
 
 @app.post("/api/loans/{lid}/return")
 def return_loan(lid: int):

@@ -1,5 +1,22 @@
 """One active loan per item + overdue detection."""
 
+import re
+from datetime import date
+
+_DUE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def validate_lend(borrower: str, due_date: str) -> dict:
+    if not (borrower or "").strip():
+        return {"ok": False, "reason": "borrower_required"}
+    due = (due_date or "").strip()
+    if not _DUE_DATE_RE.match(due):
+        return {"ok": False, "reason": "due_date_invalid"}
+    try:
+        date.fromisoformat(due)
+    except ValueError:
+        return {"ok": False, "reason": "due_date_invalid"}
+    return {"ok": True, "reason": ""}
+
 def can_lend(item_status: str, active_loans: int) -> dict:
     if item_status != "available":
         return {"ok": False, "reason": "item_not_available"}

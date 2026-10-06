@@ -1,9 +1,19 @@
-from app.engines.borrow_rules import can_lend, is_overdue, classify_loans
+from app.engines.borrow_rules import can_lend, is_overdue, classify_loans, validate_lend
 
 def test_mutex():
     assert can_lend("available", 0)["ok"]
     assert can_lend("available", 1)["reason"] == "already_on_loan"
     assert can_lend("retired", 0)["ok"] is False
+
+def test_validate_lend():
+    assert validate_lend("邻居", "2026-12-31")["ok"]
+    assert validate_lend("", "2026-12-31")["reason"] == "borrower_required"
+    assert validate_lend("   ", "2026-12-31")["reason"] == "borrower_required"
+    assert validate_lend("邻居", "")["reason"] == "due_date_invalid"
+    assert validate_lend("邻居", "2026-13-01")["reason"] == "due_date_invalid"
+    assert validate_lend("邻居", "2026-02-30")["reason"] == "due_date_invalid"
+    assert validate_lend("邻居", "2026-1-1")["reason"] == "due_date_invalid"
+    assert validate_lend("邻居", "31-12-2026")["reason"] == "due_date_invalid"
 
 def test_overdue():
     assert is_overdue("2020-01-01", "2026-01-01", "active")
