@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.borrow_rules import can_lend, classify_loans
+from app.engines.borrow_rules import can_lend, classify_loans, validate_lend_request
 
 app = FastAPI(title="Borrowboard", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -50,8 +50,44 @@ class LendIn(BaseModel):
     borrower: str
     due_date: str
 
-@app.post("/api/items/{iid}/lend")
-def lend(iid: int, body: LendIn):
+def _run_lend(iid: int, borrower: str, due_date: str) -> dict:
+    """Validate + lend in one IMMEDIATE transaction.
+
+    The availability re-check and both writes (loan insert, item status flip) commit
+    together or roll back together: a concurrent lend/return in between can never yield
+    a second active loan on the item, nor a 409 that already changed items.status.
+    """
+    v = validate_lend_request(borrower, due_date)
+    if not v["ok"]:
+        raise HTTPException(400, v["reason"])
+    c = connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+        if not item: raise HTTPException(404, "item")
+        active = c.execute("SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'", (iid,)).fetchone()["c"]
+        check = can_lend(item["status"], active)
+        if not check["ok"]: raise HTTPException(409, check["reason"])
+        cur = c.execute(
+            "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
+            (iid, borrower.strip(), "active", v["due_date"], datetime.now(timezone.utc).isoformat()))
+        flipped = c.execute("UPDATE items SET status='on_loan' WHERE id=? AND status='available'", (iid,))
+        if flipped.rowcount != 1: raise HTTPException(409, "item_not_available")
+        c.commit()
+        return {"loan_id": cur.lastrowid}
+    except HTTPException:
+        c.rollback(); raise
+    except Exception:
+        c.rollback(); raise HTTPException(500, "lend_failed")
+    finally:
+        c.close()
+
+@app.post("/api/items/{iid}/lend/preview")
+def lend_preview(iid: int, body: LendIn):
+    """Dry-run ticket: returns the item that would be occupied and the due_date.
+    Read-only — board counts and item status are untouched."""
+    v = validate_lend_request(body.borrower, body.due_date)
+    if not v["ok"]: raise HTTPException(400, v["reason"])
     c = connect()
     item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
     if not item: c.close(); raise HTTPException(404, "item")
@@ -59,11 +95,19 @@ def lend(iid: int, body: LendIn):
     check = can_lend(item["status"], active)
     if not check["ok"]:
         c.close(); raise HTTPException(409, check["reason"])
-    cur = c.execute(
-        "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
-        (iid, body.borrower, "active", body.due_date, datetime.now(timezone.utc).isoformat()))
-    c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
-    c.commit(); lid = cur.lastrowid; c.close(); return {"loan_id": lid}
+    c.close()
+    return {"item_id": item["id"], "title": item["title"],
+            "borrower": body.borrower.strip(), "due_date": v["due_date"]}
+
+@app.post("/api/items/{iid}/lend/confirm")
+def lend_confirm(iid: int, body: LendIn):
+    """Confirm a preview ticket. Re-validates at submit instant: if another lend/return
+    changed the item since the preview, the whole order fails (409) with zero writes."""
+    return _run_lend(iid, body.borrower, body.due_date)
+
+@app.post("/api/items/{iid}/lend")
+def lend(iid: int, body: LendIn):
+    return _run_lend(iid, body.borrower, body.due_date)
 
 @app.post("/api/loans/{lid}/return")
 def return_loan(lid: int):
